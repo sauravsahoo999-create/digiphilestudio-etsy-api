@@ -1,0 +1,12 @@
+{
+  "name": "digiphilestudio-etsy-api",
+  "version": "1.0.0",
+  "description": "Private Etsy shop API connector for DigiPhileStudio",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
