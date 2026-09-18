@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const app = express();
 
 app.set("trust proxy", 1);
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
@@ -24,15 +25,14 @@ const ETSY_API_BASE =
   "https://api.etsy.com/v3/application";
 
 /*
-  Etsy permissions.
+  We only request permissions actually needed
+  for the shop-data export.
 
-  email_r      = read user profile
-  shops_r      = read shop information
-  listings_r   = read listings
+  shops_r        = read shop information
+  listings_r     = read listings
   transactions_r = read sales / transaction data
 */
 const SCOPES = [
-  "email_r",
   "shops_r",
   "listings_r",
   "transactions_r"
@@ -43,7 +43,7 @@ let tokenData = null;
 const oauthStates = new Map();
 
 /* =========================================================
-   BASIC HELPERS
+   HELPERS
 ========================================================= */
 
 function baseUrl(req) {
@@ -87,7 +87,7 @@ function createState() {
 }
 
 /* =========================================================
-   ETSY OAUTH
+   OAUTH TOKEN EXCHANGE
 ========================================================= */
 
 async function exchangeAuthorizationCode(
@@ -99,7 +99,7 @@ async function exchangeAuthorizationCode(
     grant_type: "authorization_code",
     client_id: ETSY_CLIENT_ID,
     redirect_uri: redirectUri,
-    code,
+    code: code,
     code_verifier: verifier
   });
 
@@ -128,6 +128,10 @@ async function exchangeAuthorizationCode(
 
   return data;
 }
+
+/* =========================================================
+   REFRESH ACCESS TOKEN
+========================================================= */
 
 async function refreshAccessToken(
   refreshToken
@@ -185,9 +189,14 @@ async function refreshAccessToken(
   return tokenData.access_token;
 }
 
+/* =========================================================
+   GET ACCESS TOKEN
+========================================================= */
+
 async function getAccessToken() {
+
   /*
-    Use the current access token if still valid.
+    Use current in-memory access token when possible.
   */
   if (
     tokenData?.access_token &&
@@ -199,27 +208,26 @@ async function getAccessToken() {
   }
 
   /*
-    Otherwise use the refresh token.
-    Prefer the latest refresh token returned by Etsy.
-    Fall back to the Render environment variable.
+    Otherwise refresh using the latest refresh token
+    or the token stored in Render.
   */
   const refreshToken =
     tokenData?.refresh_token ||
     ETSY_REFRESH_TOKEN;
 
-  if (!refreshToken) {
-    throw new Error(
-      "Etsy is not connected. Open /oauth/start first."
+  if (refreshToken) {
+    return refreshAccessToken(
+      refreshToken
     );
   }
 
-  return refreshAccessToken(
-    refreshToken
+  throw new Error(
+    "Etsy is not connected. Open /oauth/start first."
   );
 }
 
 /* =========================================================
-   ETSY API
+   ETSY REQUEST
 ========================================================= */
 
 async function etsyRequest(
@@ -239,10 +247,6 @@ async function etsyRequest(
       headers: {
         ...(options.headers || {}),
 
-        /*
-          Etsy requires:
-          keystring:shared_secret
-        */
         "x-api-key":
           `${ETSY_CLIENT_ID}:${ETSY_SHARED_SECRET}`,
 
@@ -281,19 +285,15 @@ async function etsyRequest(
 }
 
 /* =========================================================
-   CURRENT USER
+   GET USER ID FROM TOKEN
 ========================================================= */
 
-async function getCurrentUser() {
-  const accessToken =
-    await getAccessToken();
-
-  /*
-    Etsy access tokens begin with the
-    numeric Etsy user ID followed by ".".
-  */
+function getUserIdFromToken(
+  accessToken
+) {
   const userId =
-    accessToken.split(".")[0];
+    String(accessToken)
+      .split(".")[0];
 
   if (!userId) {
     throw new Error(
@@ -301,9 +301,7 @@ async function getCurrentUser() {
     );
   }
 
-  return etsyRequest(
-    `/users/${encodeURIComponent(userId)}`
-  );
+  return userId;
 }
 
 /* =========================================================
@@ -311,13 +309,24 @@ async function getCurrentUser() {
 ========================================================= */
 
 async function getCurrentShop() {
-  const user =
-    await getCurrentUser();
+  const accessToken =
+    await getAccessToken();
 
+  const userId =
+    getUserIdFromToken(
+      accessToken
+    );
+
+  /*
+    We do NOT call the user-profile endpoint.
+    That endpoint needs email_r.
+
+    We only need the user ID to find the shop.
+  */
   const shops =
     await etsyRequest(
       `/users/${encodeURIComponent(
-        user.user_id
+        userId
       )}/shops`
     );
 
@@ -328,12 +337,16 @@ async function getCurrentShop() {
 
   if (!shop?.shop_id) {
     throw new Error(
-      "No Etsy shop was found for this account."
+      "No Etsy shop was found for this Etsy account."
     );
   }
 
   return {
-    user,
+    user: {
+      user_id:
+        userId
+    },
+
     shop
   };
 }
@@ -353,6 +366,7 @@ async function getAllPages(
   const limit = 100;
 
   while (true) {
+
     const params =
       new URLSearchParams({
         ...extraParams,
@@ -412,33 +426,37 @@ async function getAllPages(
    HOME
 ========================================================= */
 
-app.get("/", async (req, res) => {
-  let connected = false;
+app.get(
+  "/",
+  async (req, res) => {
 
-  try {
-    await getAccessToken();
-    connected = true;
-  } catch {
-    connected = false;
+    let connected = false;
+
+    try {
+      await getAccessToken();
+      connected = true;
+    } catch {
+      connected = false;
+    }
+
+    res.json({
+      service:
+        "DigiPhileStudio Etsy API",
+
+      status:
+        "online",
+
+      etsy_connected:
+        connected,
+
+      oauth_start:
+        `${baseUrl(req)}/oauth/start`,
+
+      download_page:
+        `${baseUrl(req)}/download`
+    });
   }
-
-  res.json({
-    service:
-      "DigiPhileStudio Etsy API",
-
-    status:
-      "online",
-
-    etsy_connected:
-      connected,
-
-    oauth_start:
-      `${baseUrl(req)}/oauth/start`,
-
-    download_page:
-      `${baseUrl(req)}/download`
-  });
-});
+);
 
 /* =========================================================
    HEALTH
@@ -447,20 +465,25 @@ app.get("/", async (req, res) => {
 app.get(
   "/health",
   (req, res) => {
+
     res.json({
-      status: "ok"
+      status:
+        "ok"
     });
+
   }
 );
 
 /* =========================================================
-   START OAUTH
+   OAUTH START
 ========================================================= */
 
 app.get(
   "/oauth/start",
   (req, res) => {
+
     try {
+
       requireConfig();
 
       const verifier =
@@ -532,11 +555,14 @@ app.get(
       );
 
     } catch (error) {
+
       res.status(500).json({
         error:
           error.message
       });
+
     }
+
   }
 );
 
@@ -547,7 +573,9 @@ app.get(
 app.get(
   "/oauth/callback",
   async (req, res) => {
+
     try {
+
       requireConfig();
 
       const {
@@ -558,21 +586,33 @@ app.get(
       } = req.query;
 
       if (error) {
+
         return res
           .status(400)
           .send(`
             <html>
-              <body style="font-family:Arial;padding:40px;">
-                <h2>❌ Etsy authorization failed</h2>
+              <body
+                style="
+                  font-family:Arial;
+                  padding:40px;
+                "
+              >
+
+                <h2>
+                  ❌ Etsy authorization failed
+                </h2>
+
                 <p>
                   ${error_description || error}
                 </p>
+
               </body>
             </html>
           `);
       }
 
       if (!code || !state) {
+
         return res
           .status(400)
           .send(
@@ -586,6 +626,7 @@ app.get(
         );
 
       if (!stored) {
+
         return res
           .status(400)
           .send(
@@ -602,6 +643,7 @@ app.get(
           stored.createdAt >
         10 * 60 * 1000
       ) {
+
         return res
           .status(400)
           .send(
@@ -634,8 +676,11 @@ app.get(
 
       res.send(`
         <html>
+
           <head>
-            <title>Etsy Connected</title>
+            <title>
+              Etsy Connected
+            </title>
           </head>
 
           <body
@@ -657,12 +702,11 @@ app.get(
             </p>
 
             <h3>
-              Etsy Refresh Token
+              Save this refresh token in Render
             </h3>
 
             <p>
-              Add the following value to Render
-              as the environment variable:
+              Environment variable:
             </p>
 
             <p>
@@ -683,7 +727,7 @@ app.get(
             >${refreshToken}</textarea>
 
             <p style="color:#a00;">
-              Keep this value private.
+              Keep this token private.
               Do not publish it or put it in GitHub.
             </p>
 
@@ -709,30 +753,37 @@ app.get(
       `);
 
     } catch (error) {
-      res.status(500).send(`
-        <html>
-          <body
-            style="
-              font-family:Arial;
-              padding:40px;
-            "
-          >
-            <h2>
-              ❌ Etsy connection failed
-            </h2>
 
-            <pre>
+      res
+        .status(500)
+        .send(`
+          <html>
+
+            <body
+              style="
+                font-family:Arial;
+                padding:40px;
+              "
+            >
+
+              <h2>
+                ❌ Etsy connection failed
+              </h2>
+
+              <pre>
 ${error.message}
-            </pre>
-          </body>
-        </html>
-      `);
+              </pre>
+
+            </body>
+
+          </html>
+        `);
     }
   }
 );
 
 /* =========================================================
-   CONNECTOR AUTHENTICATION
+   CONNECTOR SECURITY
 ========================================================= */
 
 function authenticateConnector(
@@ -740,7 +791,9 @@ function authenticateConnector(
   res,
   next
 ) {
+
   if (!CONNECTOR_SECRET) {
+
     return res
       .status(500)
       .json({
@@ -757,6 +810,7 @@ function authenticateConnector(
     supplied !==
     `Bearer ${CONNECTOR_SECRET}`
   ) {
+
     return res
       .status(401)
       .json({
@@ -769,39 +823,16 @@ function authenticateConnector(
 }
 
 /* =========================================================
-   USER API
-========================================================= */
-
-app.get(
-  "/api/me",
-  authenticateConnector,
-  async (req, res) => {
-    try {
-      const user =
-        await getCurrentUser();
-
-      res.json(user);
-
-    } catch (error) {
-      res
-        .status(500)
-        .json({
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =========================================================
-   SHOP API
+   SHOP ENDPOINT
 ========================================================= */
 
 app.get(
   "/api/shop",
   authenticateConnector,
   async (req, res) => {
+
     try {
+
       const {
         user,
         shop
@@ -821,6 +852,7 @@ app.get(
       });
 
     } catch (error) {
+
       res
         .status(500)
         .json({
@@ -832,14 +864,16 @@ app.get(
 );
 
 /* =========================================================
-   LISTINGS API
+   LISTINGS ENDPOINT
 ========================================================= */
 
 app.get(
   "/api/listings",
   authenticateConnector,
   async (req, res) => {
+
     try {
+
       const {
         shop
       } =
@@ -862,9 +896,11 @@ app.get(
           state
         )
       ) {
+
         return res
           .status(400)
           .json({
+
             error:
               "Invalid listing state.",
 
@@ -881,6 +917,7 @@ app.get(
         );
 
       res.json({
+
         shop_id:
           shop.shop_id,
 
@@ -890,6 +927,7 @@ app.get(
       });
 
     } catch (error) {
+
       res
         .status(500)
         .json({
@@ -901,14 +939,16 @@ app.get(
 );
 
 /* =========================================================
-   RECEIPTS API
+   RECEIPTS / ORDERS
 ========================================================= */
 
 app.get(
   "/api/receipts",
   authenticateConnector,
   async (req, res) => {
+
     try {
+
       const {
         shop
       } =
@@ -920,6 +960,7 @@ app.get(
         );
 
       res.json({
+
         shop_id:
           shop.shop_id,
 
@@ -927,6 +968,7 @@ app.get(
       });
 
     } catch (error) {
+
       res
         .status(500)
         .json({
@@ -938,14 +980,16 @@ app.get(
 );
 
 /* =========================================================
-   TRANSACTIONS API
+   TRANSACTIONS / SALES
 ========================================================= */
 
 app.get(
   "/api/transactions",
   authenticateConnector,
   async (req, res) => {
+
     try {
+
       const {
         shop
       } =
@@ -957,6 +1001,7 @@ app.get(
         );
 
       res.json({
+
         shop_id:
           shop.shop_id,
 
@@ -964,6 +1009,7 @@ app.get(
       });
 
     } catch (error) {
+
       res
         .status(500)
         .json({
@@ -975,10 +1021,11 @@ app.get(
 );
 
 /* =========================================================
-   CREATE FULL EXPORT
+   COMPLETE EXPORT
 ========================================================= */
 
 async function createExport() {
+
   const {
     user,
     shop
@@ -987,9 +1034,6 @@ async function createExport() {
 
   const listings = {};
 
-  /*
-    Get all listing states.
-  */
   for (
     const state of [
       "active",
@@ -999,6 +1043,7 @@ async function createExport() {
       "expired"
     ]
   ) {
+
     listings[state] =
       await getAllPages(
         `/shops/${shop.shop_id}/listings`,
@@ -1008,39 +1053,37 @@ async function createExport() {
       );
   }
 
-  /*
-    Get transactions.
-  */
   const transactions =
     await getAllPages(
       `/shops/${shop.shop_id}/transactions`
     );
 
-  /*
-    Get receipts.
-  */
   let receipts;
 
   try {
+
     receipts =
       await getAllPages(
         `/shops/${shop.shop_id}/receipts`
       );
+
   } catch (error) {
-    /*
-      Keep the rest of the export usable
-      if Etsy rejects receipt access because
-      of the specific permissions on the token.
-    */
+
     receipts = {
-      count: 0,
-      results: [],
+
+      count:
+        0,
+
+      results:
+        [],
+
       error:
         error.message
     };
   }
 
   return {
+
     exported_at:
       new Date().toISOString(),
 
@@ -1063,13 +1106,17 @@ async function createExport() {
 app.get(
   "/download",
   (req, res) => {
+
     res.send(`
+
       <html>
 
         <head>
+
           <title>
             DigiPhileStudio Etsy Export
           </title>
+
         </head>
 
         <body
@@ -1087,7 +1134,7 @@ app.get(
 
           <p>
             Enter your CONNECTOR_SECRET
-            to download your private Etsy data.
+            to download your private Etsy shop data.
           </p>
 
           <form
@@ -1136,14 +1183,17 @@ app.get(
 );
 
 /* =========================================================
-   DOWNLOAD EXPORT
+   DOWNLOAD
 ========================================================= */
 
 app.post(
   "/download",
   async (req, res) => {
+
     try {
+
       if (!CONNECTOR_SECRET) {
+
         return res
           .status(500)
           .send(
@@ -1159,6 +1209,7 @@ app.post(
         supplied !==
         CONNECTOR_SECRET
       ) {
+
         return res
           .status(401)
           .send(
@@ -1189,6 +1240,7 @@ app.post(
       res.send(json);
 
     } catch (error) {
+
       res
         .status(500)
         .send(
@@ -1206,8 +1258,10 @@ app.listen(
   PORT,
   "0.0.0.0",
   () => {
+
     console.log(
       `DigiPhileStudio Etsy API running on port ${PORT}`
     );
+
   }
 );
