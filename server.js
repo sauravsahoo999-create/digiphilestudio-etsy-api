@@ -4,44 +4,41 @@ const crypto = require("crypto");
 const app = express();
 
 app.set("trust proxy", 1);
+
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 
 const PORT = process.env.PORT || 3000;
 
 const ETSY_CLIENT_ID = process.env.ETSY_CLIENT_ID;
 const ETSY_SHARED_SECRET = process.env.ETSY_SHARED_SECRET;
 const CONNECTOR_SECRET = process.env.CONNECTOR_SECRET;
+const ETSY_REFRESH_TOKEN = process.env.ETSY_REFRESH_TOKEN;
 
 const ETSY_AUTHORIZE_URL = "https://www.etsy.com/oauth/connect";
 const ETSY_TOKEN_URL = "https://api.etsy.com/v3/public/oauth/token";
 const ETSY_API_BASE = "https://api.etsy.com/v3/application";
 
-/*
-  Read-only Etsy scopes for:
-  - Shop information
-  - Listings
-  - Sales / transactions
-*/
 const SCOPES = [
   "shops_r",
   "listings_r",
   "transactions_r"
 ].join(" ");
 
-/*
-  Temporary in-memory storage.
-
-  Important:
-  This is fine for the first test.
-  If the Render service restarts, you will need to authenticate again.
-*/
 let tokenData = null;
 
 const oauthStates = new Map();
 
 /* =========================================================
-   CONFIG
+   BASIC HELPERS
 ========================================================= */
+
+function baseUrl(req) {
+  return (
+    process.env.PUBLIC_BASE_URL ||
+    `${req.protocol}://${req.get("host")}`
+  );
+}
 
 function requireConfig() {
   if (!ETSY_CLIENT_ID) {
@@ -53,19 +50,10 @@ function requireConfig() {
   }
 }
 
-function baseUrl(req) {
-  return (
-    process.env.PUBLIC_BASE_URL ||
-    `${req.protocol}://${req.get("host")}`
-  );
-}
-
-/* =========================================================
-   PKCE
-========================================================= */
-
 function createPkceVerifier() {
-  return crypto.randomBytes(48).toString("base64url");
+  return crypto
+    .randomBytes(48)
+    .toString("base64url");
 }
 
 function createPkceChallenge(verifier) {
@@ -76,11 +64,13 @@ function createPkceChallenge(verifier) {
 }
 
 function createState() {
-  return crypto.randomBytes(32).toString("hex");
+  return crypto
+    .randomBytes(32)
+    .toString("hex");
 }
 
 /* =========================================================
-   ETSY OAUTH
+   OAUTH TOKEN
 ========================================================= */
 
 async function exchangeAuthorizationCode(
@@ -92,17 +82,23 @@ async function exchangeAuthorizationCode(
     grant_type: "authorization_code",
     client_id: ETSY_CLIENT_ID,
     redirect_uri: redirectUri,
-    code: code,
+    code,
     code_verifier: verifier
   });
 
-  const response = await fetch(ETSY_TOKEN_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body
-  });
+  const response = await fetch(
+    ETSY_TOKEN_URL,
+    {
+      method: "POST",
+
+      headers: {
+        "Content-Type":
+          "application/x-www-form-urlencoded"
+      },
+
+      body
+    }
+  );
 
   const data = await response.json();
 
@@ -115,26 +111,26 @@ async function exchangeAuthorizationCode(
   return data;
 }
 
-async function refreshAccessToken() {
-  if (!tokenData?.refresh_token) {
-    throw new Error(
-      "No Etsy refresh token is available. Authenticate again."
-    );
-  }
-
+async function refreshAccessToken(refreshToken) {
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     client_id: ETSY_CLIENT_ID,
-    refresh_token: tokenData.refresh_token
+    refresh_token: refreshToken
   });
 
-  const response = await fetch(ETSY_TOKEN_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body
-  });
+  const response = await fetch(
+    ETSY_TOKEN_URL,
+    {
+      method: "POST",
+
+      headers: {
+        "Content-Type":
+          "application/x-www-form-urlencoded"
+      },
+
+      body
+    }
+  );
 
   const data = await response.json();
 
@@ -148,41 +144,59 @@ async function refreshAccessToken() {
 
   tokenData = {
     ...data,
+
     expires_at:
-      Date.now() + (data.expires_in || 3600) * 1000
+      Date.now() +
+      (data.expires_in || 3600) * 1000,
+
+    refresh_token:
+      data.refresh_token || refreshToken
   };
 
   return tokenData.access_token;
 }
 
 async function getAccessToken() {
-  if (!tokenData?.access_token) {
+  /*
+    Existing in-memory access token.
+  */
+  if (
+    tokenData?.access_token &&
+    tokenData?.expires_at &&
+    Date.now() < tokenData.expires_at - 60_000
+  ) {
+    return tokenData.access_token;
+  }
+
+  /*
+    Use the refresh token from the current token
+    or from Render Environment Variables.
+  */
+  const refreshToken =
+    tokenData?.refresh_token ||
+    ETSY_REFRESH_TOKEN;
+
+  if (!refreshToken) {
     throw new Error(
       "Etsy is not connected. Open /oauth/start first."
     );
   }
 
-  /*
-    Refresh about one minute before expiry.
-  */
-  if (
-    !tokenData.expires_at ||
-    Date.now() >= tokenData.expires_at - 60_000
-  ) {
-    return refreshAccessToken();
-  }
-
-  return tokenData.access_token;
+  return refreshAccessToken(refreshToken);
 }
 
 /* =========================================================
    ETSY API REQUEST
 ========================================================= */
 
-async function etsyRequest(path, options = {}) {
+async function etsyRequest(
+  path,
+  options = {}
+) {
   requireConfig();
 
-  const accessToken = await getAccessToken();
+  const accessToken =
+    await getAccessToken();
 
   const response = await fetch(
     `${ETSY_API_BASE}${path}`,
@@ -192,30 +206,28 @@ async function etsyRequest(path, options = {}) {
       headers: {
         ...(options.headers || {}),
 
-        /*
-          Etsy requires:
-          keystring:shared_secret
-        */
         "x-api-key":
           `${ETSY_CLIENT_ID}:${ETSY_SHARED_SECRET}`,
 
-        /*
-          OAuth bearer token
-        */
         Authorization:
           `Bearer ${accessToken}`,
 
-        Accept: "application/json"
+        Accept:
+          "application/json"
       }
     }
   );
 
-  const text = await response.text();
+  const text =
+    await response.text();
 
   let data;
 
   try {
-    data = text ? JSON.parse(text) : {};
+    data =
+      text
+        ? JSON.parse(text)
+        : {};
   } catch {
     data = {
       raw: text
@@ -236,22 +248,15 @@ async function etsyRequest(path, options = {}) {
 ========================================================= */
 
 async function getCurrentUser() {
-  const accessToken = await getAccessToken();
+  const accessToken =
+    await getAccessToken();
 
-  /*
-    Etsy OAuth access tokens have the numeric Etsy
-    user ID before the first period.
-
-    Example:
-    12345678.ABCDEFG...
-
-    User ID = 12345678
-  */
-  const userId = accessToken.split(".")[0];
+  const userId =
+    accessToken.split(".")[0];
 
   if (!userId) {
     throw new Error(
-      "Could not determine Etsy user ID from access token."
+      "Could not determine Etsy user ID."
     );
   }
 
@@ -265,11 +270,13 @@ async function getCurrentUser() {
 ========================================================= */
 
 async function getCurrentShop() {
-  const user = await getCurrentUser();
+  const user =
+    await getCurrentUser();
 
-  const shops = await etsyRequest(
-    `/users/${encodeURIComponent(user.user_id)}/shops`
-  );
+  const shops =
+    await etsyRequest(
+      `/users/${encodeURIComponent(user.user_id)}/shops`
+    );
 
   const shop =
     Array.isArray(shops?.results)
@@ -303,30 +310,34 @@ async function getAllPages(
   const limit = 100;
 
   while (true) {
-    const params = new URLSearchParams({
-      ...extraParams,
-      limit: String(limit),
-      offset: String(offset)
-    });
+    const params =
+      new URLSearchParams({
+        ...extraParams,
 
-    const data = await etsyRequest(
-      `${path}?${params.toString()}`
+        limit:
+          String(limit),
+
+        offset:
+          String(offset)
+      });
+
+    const data =
+      await etsyRequest(
+        `${path}?${params.toString()}`
+      );
+
+    const results =
+      Array.isArray(data?.results)
+        ? data.results
+        : [];
+
+    allResults.push(
+      ...results
     );
 
-    const results = Array.isArray(data?.results)
-      ? data.results
-      : [];
+    const count =
+      Number(data?.count || 0);
 
-    allResults.push(...results);
-
-    const count = Number(data?.count || 0);
-
-    /*
-      Stop when:
-      - no results
-      - all results have been collected
-      - fewer than 100 results returned
-    */
     if (
       results.length === 0 ||
       allResults.length >= count ||
@@ -338,7 +349,7 @@ async function getAllPages(
     offset += limit;
 
     /*
-      Safety limit.
+      Safety limit for the first version.
     */
     if (offset > 12000) {
       break;
@@ -346,25 +357,43 @@ async function getAllPages(
   }
 
   return {
-    count: allResults.length,
-    results: allResults
+    count:
+      allResults.length,
+
+    results:
+      allResults
   };
 }
 
 /* =========================================================
-   BASIC STATUS
+   HOME / STATUS
 ========================================================= */
 
-app.get("/", (req, res) => {
+app.get("/", async (req, res) => {
+  let connected = false;
+
+  try {
+    await getAccessToken();
+    connected = true;
+  } catch {
+    connected = false;
+  }
+
   res.json({
-    service: "DigiPhileStudio Etsy API",
-    status: "online",
+    service:
+      "DigiPhileStudio Etsy API",
+
+    status:
+      "online",
 
     etsy_connected:
-      Boolean(tokenData?.access_token),
+      connected,
 
     oauth_start:
-      `${baseUrl(req)}/oauth/start`
+      `${baseUrl(req)}/oauth/start`,
+
+    download_page:
+      `${baseUrl(req)}/download`
   });
 });
 
@@ -375,81 +404,94 @@ app.get("/health", (req, res) => {
 });
 
 /* =========================================================
-   ETSY OAUTH START
+   OAUTH START
 ========================================================= */
 
-app.get("/oauth/start", (req, res) => {
-  try {
-    requireConfig();
+app.get(
+  "/oauth/start",
+  (req, res) => {
+    try {
+      requireConfig();
 
-    const verifier =
-      createPkceVerifier();
+      const verifier =
+        createPkceVerifier();
 
-    const challenge =
-      createPkceChallenge(verifier);
+      const challenge =
+        createPkceChallenge(
+          verifier
+        );
 
-    const state =
-      createState();
+      const state =
+        createState();
 
-    oauthStates.set(state, {
-      verifier,
-      createdAt: Date.now()
-    });
+      oauthStates.set(
+        state,
+        {
+          verifier,
 
-    const redirectUri =
-      `${baseUrl(req)}/oauth/callback`;
+          createdAt:
+            Date.now()
+        }
+      );
 
-    const url =
-      new URL(ETSY_AUTHORIZE_URL);
+      const redirectUri =
+        `${baseUrl(req)}/oauth/callback`;
 
-    url.searchParams.set(
-      "response_type",
-      "code"
-    );
+      const url =
+        new URL(
+          ETSY_AUTHORIZE_URL
+        );
 
-    url.searchParams.set(
-      "client_id",
-      ETSY_CLIENT_ID
-    );
+      url.searchParams.set(
+        "response_type",
+        "code"
+      );
 
-    url.searchParams.set(
-      "redirect_uri",
-      redirectUri
-    );
+      url.searchParams.set(
+        "client_id",
+        ETSY_CLIENT_ID
+      );
 
-    url.searchParams.set(
-      "scope",
-      SCOPES
-    );
+      url.searchParams.set(
+        "redirect_uri",
+        redirectUri
+      );
 
-    url.searchParams.set(
-      "state",
-      state
-    );
+      url.searchParams.set(
+        "scope",
+        SCOPES
+      );
 
-    url.searchParams.set(
-      "code_challenge",
-      challenge
-    );
+      url.searchParams.set(
+        "state",
+        state
+      );
 
-    url.searchParams.set(
-      "code_challenge_method",
-      "S256"
-    );
+      url.searchParams.set(
+        "code_challenge",
+        challenge
+      );
 
-    res.redirect(
-      url.toString()
-    );
+      url.searchParams.set(
+        "code_challenge_method",
+        "S256"
+      );
 
-  } catch (error) {
-    res.status(500).json({
-      error: error.message
-    });
+      res.redirect(
+        url.toString()
+      );
+
+    } catch (error) {
+      res.status(500).json({
+        error:
+          error.message
+      });
+    }
   }
-});
+);
 
 /* =========================================================
-   ETSY OAUTH CALLBACK
+   OAUTH CALLBACK
 ========================================================= */
 
 app.get(
@@ -465,23 +507,17 @@ app.get(
         error_description
       } = req.query;
 
-      /*
-        Etsy returned an OAuth error.
-      */
       if (error) {
         return res.status(400).send(`
           <html>
-            <body style="font-family: Arial; padding: 40px;">
-              <h2>Etsy authorization failed</h2>
+            <body style="font-family:Arial;padding:40px;">
+              <h2>❌ Etsy authorization failed</h2>
               <p>${error_description || error}</p>
             </body>
           </html>
         `);
       }
 
-      /*
-        Required OAuth parameters missing.
-      */
       if (!code || !state) {
         return res.status(400).send(
           "Missing Etsy authorization code or state."
@@ -489,7 +525,9 @@ app.get(
       }
 
       const stored =
-        oauthStates.get(state);
+        oauthStates.get(
+          state
+        );
 
       if (!stored) {
         return res.status(400).send(
@@ -497,17 +535,17 @@ app.get(
         );
       }
 
-      oauthStates.delete(state);
+      oauthStates.delete(
+        state
+      );
 
-      /*
-        OAuth request expires after 10 minutes.
-      */
       if (
-        Date.now() - stored.createdAt >
+        Date.now() -
+          stored.createdAt >
         10 * 60 * 1000
       ) {
         return res.status(400).send(
-          "OAuth request expired. Please try again."
+          "OAuth request expired. Start again."
         );
       }
 
@@ -530,6 +568,13 @@ app.get(
             1000
       };
 
+      const refreshToken =
+        newTokenData.refresh_token;
+
+      /*
+        Show the refresh token once so the owner
+        can save it securely in Render.
+      */
       res.send(`
         <html>
           <head>
@@ -538,27 +583,59 @@ app.get(
 
           <body
             style="
-              font-family: Arial;
-              padding: 40px;
-              max-width: 700px;
+              font-family:Arial;
+              padding:40px;
+              max-width:900px;
+              margin:auto;
             "
           >
 
             <h2>✅ Etsy connected successfully</h2>
 
             <p>
-              Your Etsy account has authorized
-              the DigiPhileStudio application.
+              Your Etsy account is now authorized.
+            </p>
+
+            <h3>Important: save the refresh token</h3>
+
+            <p>
+              Copy the value below and add it to
+              your Render Environment Variables as:
             </p>
 
             <p>
-              You can now use the protected
-              Etsy API endpoints.
+              <strong>ETSY_REFRESH_TOKEN</strong>
+            </p>
+
+            <textarea
+              readonly
+              style="
+                width:100%;
+                height:110px;
+                padding:12px;
+                font-family:monospace;
+              "
+            >${refreshToken || ""}</textarea>
+
+            <p style="color:#a00;">
+              Treat this refresh token like a password.
+              Do not share it publicly.
+            </p>
+
+            <hr>
+
+            <p>
+              After adding ETSY_REFRESH_TOKEN to Render,
+              redeploy the service.
             </p>
 
             <p>
-              <a href="/">
-                Open service status
+              Then open:
+            </p>
+
+            <p>
+              <a href="/download">
+                Open Etsy Data Download
               </a>
             </p>
 
@@ -571,15 +648,12 @@ app.get(
         <html>
           <body
             style="
-              font-family: Arial;
-              padding: 40px;
+              font-family:Arial;
+              padding:40px;
             "
           >
-
-            <h2>Etsy connection failed</h2>
-
+            <h2>❌ Etsy connection failed</h2>
             <pre>${error.message}</pre>
-
           </body>
         </html>
       `);
@@ -588,7 +662,7 @@ app.get(
 );
 
 /* =========================================================
-   API SECURITY
+   CONNECTOR AUTH
 ========================================================= */
 
 function authenticateConnector(
@@ -611,7 +685,8 @@ function authenticateConnector(
     `Bearer ${CONNECTOR_SECRET}`
   ) {
     return res.status(401).json({
-      error: "Unauthorized"
+      error:
+        "Unauthorized"
     });
   }
 
@@ -619,7 +694,7 @@ function authenticateConnector(
 }
 
 /* =========================================================
-   USER
+   USER API
 ========================================================= */
 
 app.get(
@@ -634,14 +709,15 @@ app.get(
 
     } catch (error) {
       res.status(500).json({
-        error: error.message
+        error:
+          error.message
       });
     }
   }
 );
 
 /* =========================================================
-   SHOP
+   SHOP API
 ========================================================= */
 
 app.get(
@@ -652,7 +728,8 @@ app.get(
       const {
         user,
         shop
-      } = await getCurrentShop();
+      } =
+        await getCurrentShop();
 
       const fullShop =
         await etsyRequest(
@@ -661,19 +738,21 @@ app.get(
 
       res.json({
         user,
-        shop: fullShop
+        shop:
+          fullShop
       });
 
     } catch (error) {
       res.status(500).json({
-        error: error.message
+        error:
+          error.message
       });
     }
   }
 );
 
 /* =========================================================
-   LISTINGS
+   LISTINGS API
 ========================================================= */
 
 app.get(
@@ -683,7 +762,8 @@ app.get(
     try {
       const {
         shop
-      } = await getCurrentShop();
+      } =
+        await getCurrentShop();
 
       const state =
         req.query.state ||
@@ -698,7 +778,9 @@ app.get(
       ];
 
       if (
-        !allowedStates.includes(state)
+        !allowedStates.includes(
+          state
+        )
       ) {
         return res.status(400).json({
           error:
@@ -712,10 +794,7 @@ app.get(
         await getAllPages(
           `/shops/${shop.shop_id}/listings`,
           {
-            state,
-
-            includes:
-              "personalization"
+            state
           }
         );
 
@@ -730,14 +809,15 @@ app.get(
 
     } catch (error) {
       res.status(500).json({
-        error: error.message
+        error:
+          error.message
       });
     }
   }
 );
 
 /* =========================================================
-   RECEIPTS / ORDERS
+   RECEIPTS
 ========================================================= */
 
 app.get(
@@ -747,7 +827,8 @@ app.get(
     try {
       const {
         shop
-      } = await getCurrentShop();
+      } =
+        await getCurrentShop();
 
       const data =
         await getAllPages(
@@ -763,14 +844,15 @@ app.get(
 
     } catch (error) {
       res.status(500).json({
-        error: error.message
+        error:
+          error.message
       });
     }
   }
 );
 
 /* =========================================================
-   TRANSACTIONS / SALES
+   TRANSACTIONS
 ========================================================= */
 
 app.get(
@@ -780,7 +862,8 @@ app.get(
     try {
       const {
         shop
-      } = await getCurrentShop();
+      } =
+        await getCurrentShop();
 
       const data =
         await getAllPages(
@@ -796,87 +879,193 @@ app.get(
 
     } catch (error) {
       res.status(500).json({
-        error: error.message
+        error:
+          error.message
       });
     }
   }
 );
 
 /* =========================================================
-   COMPLETE EXPORT
+   FULL EXPORT
+========================================================= */
+
+async function createExport() {
+  const {
+    user,
+    shop
+  } =
+    await getCurrentShop();
+
+  const listings = {};
+
+  for (
+    const state of [
+      "active",
+      "inactive",
+      "sold_out",
+      "draft",
+      "expired"
+    ]
+  ) {
+    listings[state] =
+      await getAllPages(
+        `/shops/${shop.shop_id}/listings`,
+        {
+          state
+        }
+      );
+  }
+
+  const receipts =
+    await getAllPages(
+      `/shops/${shop.shop_id}/receipts`
+    );
+
+  const transactions =
+    await getAllPages(
+      `/shops/${shop.shop_id}/transactions`
+    );
+
+  return {
+    exported_at:
+      new Date().toISOString(),
+
+    user,
+
+    shop,
+
+    listings,
+
+    receipts,
+
+    transactions
+  };
+}
+
+/* =========================================================
+   DOWNLOAD PAGE
 ========================================================= */
 
 app.get(
-  "/api/export",
-  authenticateConnector,
+  "/download",
+  (req, res) => {
+    res.send(`
+      <html>
+        <head>
+          <title>DigiPhileStudio Etsy Export</title>
+        </head>
+
+        <body
+          style="
+            font-family:Arial;
+            padding:40px;
+            max-width:700px;
+            margin:auto;
+          "
+        >
+
+          <h2>📦 DigiPhileStudio Etsy Export</h2>
+
+          <p>
+            Enter your CONNECTOR_SECRET to download
+            your private Etsy shop data.
+          </p>
+
+          <form
+            method="POST"
+            action="/download"
+          >
+
+            <label>
+              CONNECTOR_SECRET
+            </label>
+
+            <br><br>
+
+            <input
+              type="password"
+              name="secret"
+              required
+              style="
+                width:100%;
+                padding:12px;
+                box-sizing:border-box;
+              "
+            >
+
+            <br><br>
+
+            <button
+              type="submit"
+              style="
+                padding:12px 20px;
+                cursor:pointer;
+              "
+            >
+              Download Etsy Data
+            </button>
+
+          </form>
+
+        </body>
+      </html>
+    `);
+  }
+);
+
+/* =========================================================
+   DOWNLOAD EXPORT
+========================================================= */
+
+app.post(
+  "/download",
   async (req, res) => {
     try {
-      const {
-        user,
-        shop
-      } = await getCurrentShop();
-
-      const listings = {};
-
-      /*
-        Collect all listing states.
-      */
-      for (
-        const state of [
-          "active",
-          "inactive",
-          "sold_out",
-          "draft",
-          "expired"
-        ]
-      ) {
-        listings[state] =
-          await getAllPages(
-            `/shops/${shop.shop_id}/listings`,
-            {
-              state,
-
-              includes:
-                "personalization"
-            }
-          );
+      if (!CONNECTOR_SECRET) {
+        return res.status(500).send(
+          "CONNECTOR_SECRET is not configured."
+        );
       }
 
-      /*
-        Collect receipts.
-      */
-      const receipts =
-        await getAllPages(
-          `/shops/${shop.shop_id}/receipts`
+      const supplied =
+        req.body.secret || "";
+
+      if (
+        supplied !==
+        CONNECTOR_SECRET
+      ) {
+        return res.status(401).send(
+          "Invalid CONNECTOR_SECRET."
+        );
+      }
+
+      const data =
+        await createExport();
+
+      const json =
+        JSON.stringify(
+          data,
+          null,
+          2
         );
 
-      /*
-        Collect sales transactions.
-      */
-      const transactions =
-        await getAllPages(
-          `/shops/${shop.shop_id}/transactions`
-        );
+      res.setHeader(
+        "Content-Type",
+        "application/json"
+      );
 
-      res.json({
-        exported_at:
-          new Date().toISOString(),
+      res.setHeader(
+        "Content-Disposition",
+        'attachment; filename="digiphilestudio-etsy-export.json"'
+      );
 
-        user,
-
-        shop,
-
-        listings,
-
-        receipts,
-
-        transactions
-      });
+      res.send(json);
 
     } catch (error) {
-      res.status(500).json({
-        error: error.message
-      });
+      res.status(500).send(
+        `Export failed: ${error.message}`
+      );
     }
   }
 );
@@ -887,6 +1076,7 @@ app.get(
 
 app.listen(
   PORT,
+  "0.0.0.0",
   () => {
     console.log(
       `DigiPhileStudio Etsy API running on port ${PORT}`
